@@ -1,0 +1,1 @@
+NUR Multi-AI. APK is built by GitHub Actions (Build APK workflow). API keys are entered inside the app only, never stored in this repo.
