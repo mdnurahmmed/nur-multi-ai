@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NUR Multi-AI</title>
+<style>
+    body { font-family: sans-serif; margin: 0; padding: 12px; background: #111; color: #eee; }
+    h1 { font-size: 1.2rem; }
+    h2 { font-size: 1rem; margin-top: 22px; }
+    input, select, textarea, button { width: 100%; box-sizing: border-box; margin: 4px 0; padding: 9px; font-size: 1rem; background: #222; color: #eee; border: 1px solid #444; border-radius: 6px; }
+    button { background: #2a6; border: 0; }
+    button.small { width: auto; background: #a33; padding: 4px 10px; margin-left: 6px; }
+    button.alt { background: #35a; }
+    textarea { min-height: 130px; }
+    .card { border: 1px solid #333; border-radius: 8px; padding: 8px; margin: 6px 0; }
+    .ok { color: #6d6; }
+    .warn { color: #db5; }
+    .no { color: #e77; }
+    .muted { color: #999; font-size: 0.85rem; }
+    .bar { height: 6px; background: #333; border-radius: 3px; margin-top: 4px; }
+    .bar > div { height: 6px; border-radius: 3px; background: #2a6; }
+</style>
+</head>
+<body>
+<h1>NUR Multi-AI</h1>
+
+<h2>লাইভ লিমিট বোর্ড</h2>
+<div id="board"></div>
+<button id="refresh_btn" class="alt">বোর্ড রিফ্রেশ</button>
+
+<h2>AI যোগ করো</h2>
+<select id="preset">
+    <option value="">প্রিসেট বেছে নাও</option>
+    <option value="Groq|https://api.groq.com/openai/v1">Groq</option>
+    <option value="OpenRouter|https://openrouter.ai/api/v1">OpenRouter</option>
+    <option value="Gemini|https://generativelanguage.googleapis.com/v1beta/openai">Gemini</option>
+    <option value="|">অন্য (নিজে লেখো)</option>
+</select>
+<input id="p_name" placeholder="নাম">
+<input id="p_url" placeholder="Base URL (https://...)">
+<input id="p_key" type="password" placeholder="API key (শুধু এখানে বসাও)">
+<input id="p_model" list="model_list" placeholder="মডেলের নাম">
+<datalist id="model_list"></datalist>
+<input id="p_limit" type="number" min="0" placeholder="দৈনিক request লিমিট (ঐচ্ছিক, আনুমানিক গণনার জন্য)">
+<button id="models_btn" class="alt">মডেল তালিকা আনো</button>
+<button id="add_btn">যোগ করো</button>
+<div id="provider_list"></div>
+
+<h2>কাজ</h2>
+<textarea id="goal" placeholder="লক্ষ্য: ফাইলটা কী হওয়া উচিত"></textarea>
+<input id="file_input" type="file">
+<textarea id="doc" placeholder="অথবা এখানে লেখা পেস্ট করো"></textarea>
+<input id="rounds" type="number" min="1" max="60" value="9">
+<button id="run_btn">শুরু করো</button>
+<div id="status" class="muted"></div>
+
+<h2>চূড়ান্ত ফাইল</h2>
+<textarea id="result" readonly></textarea>
+<button id="copy_btn" class="alt">কপি করো</button>
+<button id="download_btn">ডাউনলোড</button>
+
+<h2>লগ (কে কী বদলাল ও কেন)</h2>
+<div id="log"></div>
+
+<script>
+"use strict";
+// CORE_START
+const MAX_FIELD_LEN = 20000;
+
+/**
+ * Pull the first JSON object out of a model reply.
+ * @param {string} text
+ * @returns {object|null}
+ */
+function extract_json(text) {
+    if (typeof text !== "string") {
+        return null;
+    }
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start === -1 || end <= start) {
+        return null;
+    }
+    try {
+        return JSON.parse(text.slice(start, end + 1));
+    } catch (error) {
+        return null;
+    }
+}
+
+/**
+ * Check a provider config. Returns the list of invalid field names.
+ * @param {object} provider
+ * @returns {string[]}
+ */
+function validate_provider(provider) {
+    const errors = [];
+    const value = provider || {};
+    if (typeof value.name !== "string" || value.name.trim() === "") {
+        errors.push("name");
+    }
+    if (typeof value.base_url !== "string" || !/^https:\/\/\S+$/.test(value.base_url)) {
+        errors.push("base_url");
+    }
+    if (typeof value.api_key !== "string" || value.api_key.trim() === "") {
+        errors.push("api_key");
+    }
+    if (typeof value.model !== "string" || value.model.trim() === "") {
+        errors.push("model");
+    }
+    return errors;
+}
+
+/**
+ * Lowercase all header names.
+ * @param {object} headers
+ * @returns {object}
+ */
+function lower_headers(headers) {
+    const out = {};
+    Object.keys(headers || {}).forEach(function (key) {
+        out[key.toLowerCase()] = headers[key];
+    });
+    return out;
+}
+
+/**
+ * Send one chat request to an OpenAI-compatible endpoint.
+ * @param {object} provider
+ * @param {object[]} messages
+ * @param {function} http_post async (url, headers, body) => {status, headers, body}
+ * @returns {Promise<{text: string, headers: object}>}
+ */
+async function chat(provider, messages, http_post) {
+    const url = provider.base_url.replace(/\/+$/, "") + "/chat/completions";
+    const headers = {
+        "Authorization": "Bearer " + provider.api_key,
+        "Content-Type": "application/json",
+    };
+    const body = JSON.stringify({
+        model: provider.model,
+        messages: messages,
+        temperature: 0.2,
+    });
+    const response = await http_post(url, headers, body);
+    if (response.status !== 200) {
+        throw new Error(provider.name + ": HTTP " + response.status);
+    }
+    const data = typeof response.body === "string" ? JSON.parse(response.body) : response.body;
+    const choice = data && data.choices && data.choices[0];
+    if (!choice || !choice.message || typeof choice.message.content !== "string") {
+        throw new Error(provider.name + ": unexpected reply format");
+    }
+    return {text: choice.message.content, headers: lower_headers(response.headers)};
+}
+
+/**
+ * Apply a find/replace patch. The find text must occur exactly once.
+ * @param {string} document
+ * @param {string} find
+ * @param {string} replace
+ * @returns {{ok: boolean, document: string, error: string}}
+ */
+function apply_patch(document, find, replace) {
+    if (typeof find !== "string" || find === "") {
+        return {ok: false, document: document, error: "empty find"};
+    }
+    if (typeof replace !== "string") {
+        return {ok: false, document: document, error: "invalid replace"};
+    }
+    if (find.length > MAX_FIELD_LEN || replace.length > MAX_FIELD_LEN) {
+        return {ok: false, document: document, error: "patch too large"};
+    }
+    const first = document.indexOf(find);
+    if (first === -1) {
+        return {ok: false, document: document, error: "find text not found"};
+    }
+    if (document.indexOf(find, first + 1) !== -1) {
+        return {ok: false, document: document, error: "find text not unique"};
+    }
+    const updated = document.slice(0, first) + replace + document.slice(first + find.length);
+    return {ok: true, document: updated, error: ""};
+}
+
+/**
+ * @param {string} document
+ * @param {string} goal
+ * @returns {object[]}
+ */
+function build_proposal_messages(document, goal) {
+    const system = "You are a careful collaborator editing one shared document. "
+        + "Propose exactly ONE small improvement as JSON only: "
+        + "{\"find\": \"exact text that appears once\", \"replace\": \"new text\", "
+        + "\"reason\": \"why this change is correct\"}. "
+        + "Never change anything without a concrete reason. Check for bugs and side effects "
+        + "before proposing. If nothing needs improving reply {\"done\": true}.";
+    const user = "Goal: " + goal + "\n\nDocument:\n" + document;
+    return [{role: "system", content: system}, {role: "user", content: user}];
+}
+
+/**
+ * @param {string} document
+ * @param {object} proposal
+ * @returns {object[]}
+ */
+function build_review_messages(document, proposal) {
+    const system = "You review one proposed edit to a shared document. "
+        + "Check the reason and look for new bugs. Reply JSON only: "
+        + "{\"vote\": \"accept\" or \"reject\", \"reason\": \"short reason\"}.";
+    const user = "Document:\n" + document
+        + "\n\nProposed edit:\nfind: " + proposal.find
+        + "\nreplace: " + proposal.replace
+        + "\nreason: " + proposal.reason;
+    return [{role: "system", content: system}, {role: "user", content: user}];
+}
+
+/**
+ * Run a collaboration session. Providers take turns proposing one patch with a
+ * reason; the others vote with a reason. A patch is applied only with a
+ * non-empty reason and at least one accept vote. Providers that report no
+ * remaining limit are skipped.
+ * @param {object} options
+ * @param {object[]} options.providers at least two valid providers
+ * @param {string} options.document starting text
+ * @param {string} options.goal what the document should achieve
+ * @param {number} options.rounds maximum number of turns
+ * @param {function} options.http_post transport
+ * @param {function} [options.is_available] provider => boolean
+ * @param {function} [options.on_event] progress callback
+ * @returns {Promise<{document: string, log: object[]}>}
+ */
+async function run_session(options) {
+    const providers = options.providers;
+    const notify = options.on_event || function () {};
+    const is_available = options.is_available || function () {
+        return true;
+    };
+    const log = [];
+    let document = options.document;
+    let done_streak = 0;
+
+    if (!Array.isArray(providers) || providers.length < 2) {
+        throw new Error("at least two providers are required");
+    }
+    for (const provider of providers) {
+        const errors = validate_provider(provider);
+        if (errors.length > 0) {
+            throw new Error("invalid provider " + provider.name + ": " + errors.join(", "));
+        }
+    }
+
+    async function call_ai(provider, messages) {
+        notify({type: "call", provider: provider.name});
+        try {
+            const reply = await chat(provider, messages, options.http_post);
+            notify({type: "headers", provider: provider.name, headers: reply.headers});
+            return reply;
+        } catch (error) {
+            notify({type: "failure", provider: provider.name, message: String(error.message || error)});
+            throw error;
+        }
+    }
+
+    function push_entry(entry) {
+        log.push(entry);
+        notify({type: "entry", entry: entry});
+    }
+
+    for (let round = 0; round < options.rounds; round += 1) {
+        const active = providers.filter(is_available);
+        if (active.length < 2) {
+            push_entry({round: round + 1, proposer: "-", applied: false, votes: [],
+                note: "stopped: fewer than two AIs have limit left"});
+            break;
+        }
+        const proposer = active[round % active.length];
+        const reviewers = active.filter(function (item) {
+            return item !== proposer;
+        });
+        const entry = {round: round + 1, proposer: proposer.name, applied: false, votes: []};
+
+        let proposal = null;
+        try {
+            const reply = await call_ai(proposer, build_proposal_messages(document, options.goal));
+            proposal = extract_json(reply.text);
+        } catch (error) {
+            entry.error = String(error.message || error);
+        }
+
+        if (proposal && proposal.done === true) {
+            done_streak += 1;
+            entry.note = "no change needed";
+            push_entry(entry);
+            if (done_streak >= active.length) {
+                break;
+            }
+            continue;
+        }
+        done_streak = 0;
+
+        if (!proposal || typeof proposal.reason !== "string" || proposal.reason.trim() === "") {
+            entry.note = entry.error ? "proposal failed" : "rejected: no reason given";
+            push_entry(entry);
+            continue;
+        }
+
+        entry.find = proposal.find;
+        entry.replace = proposal.replace;
+        entry.reason = proposal.reason;
+
+        const check = apply_patch(document, proposal.find, proposal.replace);
+        if (!check.ok) {
+            entry.note = "rejected: " + check.error;
+            push_entry(entry);
+            continue;
+        }
+
+        let accepts = 0;
+        for (const reviewer of reviewers) {
+            const vote = {reviewer: reviewer.name};
+            try {
+                const reply = await call_ai(reviewer, build_review_messages(document, proposal));
+                const parsed = extract_json(reply.text);
+                const accepted = Boolean(parsed) && parsed.vote === "accept"
+                    && typeof parsed.reason === "string" && parsed.reason.trim() !== "";
+                vote.vote = accepted ? "accept" : "reject";
+                vote.reason = parsed && typeof parsed.reason === "string" ? parsed.reason : "";
+                if (accepted) {
+                    accepts += 1;
+                }
+            } catch (error) {
+                vote.vote = "error";
+                vote.reason = String(error.message || error);
+            }
+            entry.votes.push(vote);
+        }
+
+        if (accepts >= 1) {
+            document = check.document;
+            entry.applied = true;
+        }
+        push_entry(entry);
+    }
+
+    return {document: document, log: log};
+}
+
+/**
+ * Read live limit numbers from response headers (Groq style names).
+ * @param {object} headers lowercase header names
+ * @returns {{remaining: (number|null), limit: (number|null), tokens: (number|null), reset: string}|null}
+ */
+function parse_limit_headers(headers) {
+    const source = headers || {};
+    const remaining = parseInt(source["x-ratelimit-remaining-requests"], 10);
+    const limit = parseInt(source["x-ratelimit-limit-requests"], 10);
+    const tokens = parseInt(source["x-ratelimit-remaining-tokens"], 10);
+    if (Number.isNaN(remaining) && Number.isNaN(tokens)) {
+        return null;
+    }
+    return {
+        remaining: Number.isNaN(remaining) ? null : remaining,
+        limit: Number.isNaN(limit) ? null : limit,
+        tokens: Number.isNaN(tokens) ? null : tokens,
+        reset: String(source["x-ratelimit-reset-requests"] || ""),
+    };
+}
+
+/**
+ * Read OpenRouter GET /key data.
+ * @param {object} data parsed JSON body
+ * @returns {{remaining: (number|null), limit: (number|null), note: string}|null}
+ */
+function parse_openrouter_key(data) {
+    const info = data && data.data;
+    if (!info) {
+        return null;
+    }
+    const free = info.free_model_daily_requests;
+    if (free && typeof free.remaining === "number") {
+        return {remaining: free.remaining, limit: free.limit, note: "free models, UTC day"};
+    }
+    if (typeof info.limit_remaining === "number") {
+        return {remaining: info.limit_remaining, limit: info.limit, note: "credit USD"};
+    }
+    return null;
+}
+// CORE_END
+
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = {
+        extract_json: extract_json,
+        validate_provider: validate_provider,
+        chat: chat,
+        apply_patch: apply_patch,
+        run_session: run_session,
+        parse_limit_headers: parse_limit_headers,
+        parse_openrouter_key: parse_openrouter_key,
+    };
+}
+</script>
+
+<script>
+"use strict";
+// UI_START
+const STORAGE_KEY = "nur_providers";
+const USAGE_KEY = "nur_usage";
+const COOLDOWN_MS = 60000;
+const live = {};
+
+/**
+ * Transport. With CapacitorHttp enabled in the APK, fetch runs natively (no CORS).
+ */
+async function http_request(method, url, headers, body) {
+    const options = {method: method, headers: headers};
+    if (body !== undefined) {
+        options.body = body;
+    }
+    const response = await fetch(url, options);
+    const text = await response.text();
+    const out = {};
+    response.headers.forEach(function (value, key) {
+        out[key] = value;
+    });
+    return {status: response.status, headers: out, body: text};
+}
+
+function http_post(url, headers, body) {
+    return http_request("POST", url, headers, body);
+}
+
+function today_key() {
+    return new Date().toISOString().slice(0, 10);
+}
+
+function read_json(key, fallback) {
+    try {
+        const parsed = JSON.parse(localStorage.getItem(key) || "null");
+        return parsed === null ? fallback : parsed;
+    } catch (error) {
+        return fallback;
+    }
+}
+
+function write_json(key, value) {
+    try {
+        localStorage.setItem(key, JSON.stringify(value));
+    } catch (error) {
+        set_status("সংরক্ষণ করা গেল না");
+    }
+}
+
+function set_status(text) {
+    document.getElementById("status").textContent = text;
+}
+
+function load_providers() {
+    const list = read_json(STORAGE_KEY, []);
+    return Array.isArray(list) ? list : [];
+}
+
+function usage_for(name) {
+    const all = read_json(USAGE_KEY, {});
+    const entry = all[name];
+    if (!entry || entry.day !== today_key()) {
+        return {day: today_key(), count: 0};
+    }
+    return entry;
+}
+
+function bump_usage(name) {
+    const all = read_json(USAGE_KEY, {});
+    const entry = usage_for(name);
+    entry.count += 1;
+    all[name] = entry;
+    write_json(USAGE_KEY, all);
+}
+
+/**
+ * A provider is unavailable when its live header says zero left,
+ * when it was rate limited in the last minute, or when the self count
+ * reached the daily limit the user entered.
+ */
+function is_available(provider) {
+    const state = live[provider.name] || {};
+    if (state.limited_at && Date.now() - state.limited_at < COOLDOWN_MS) {
+        return false;
+    }
+    if (state.remaining === 0) {
+        return false;
+    }
+    if (provider.daily_limit && usage_for(provider.name).count >= provider.daily_limit) {
+        return false;
+    }
+    return true;
+}
+
+function handle_event(event) {
+    if (event.type === "entry") {
+        render_entry(event.entry);
+        return;
+    }
+    if (event.type === "call") {
+        bump_usage(event.provider);
+    } else if (event.type === "headers") {
+        const parsed = parse_limit_headers(event.headers);
+        if (parsed) {
+            live[event.provider] = Object.assign({}, live[event.provider], {
+                remaining: parsed.remaining,
+                limit: parsed.limit,
+                tokens: parsed.tokens,
+                reset: parsed.reset,
+                source: "header",
+                limited_at: 0,
+            });
+        }
+    } else if (event.type === "failure" && event.message.indexOf("429") !== -1) {
+        live[event.provider] = Object.assign({}, live[event.provider], {limited_at: Date.now()});
+    }
+    render_board();
+}
+
+function render_board() {
+    const box = document.getElementById("board");
+    box.textContent = "";
+    const providers = load_providers();
+    if (providers.length === 0) {
+        box.textContent = "কোনো AI যোগ করা হয়নি";
+        return;
+    }
+    providers.forEach(function (provider) {
+        const state = live[provider.name] || {};
+        const used = usage_for(provider.name).count;
+        const card = document.createElement("div");
+        card.className = "card";
+        const title = document.createElement("div");
+        title.textContent = provider.name + (is_available(provider) ? "" : " · সাময়িক বন্ধ");
+        title.className = is_available(provider) ? "ok" : "no";
+        card.appendChild(title);
+
+        const lines = [];
+        let ratio = null;
+        if (typeof state.remaining === "number") {
+            const total = typeof state.limit === "number" ? " / " + state.limit : "";
+            lines.push("বাকি request: " + state.remaining + total + " (" + (state.source || "") + ")");
+            if (typeof state.limit === "number" && state.limit > 0) {
+                ratio = state.remaining / state.limit;
+            }
+        }
+        if (typeof state.tokens === "number") {
+            lines.push("বাকি token: " + state.tokens);
+        }
+        if (state.reset) {
+            lines.push("রিসেট: " + state.reset);
+        }
+        if (provider.daily_limit) {
+            lines.push("আজ গণনা: " + used + " / " + provider.daily_limit + " (আনুমানিক)");
+            if (ratio === null) {
+                ratio = Math.max(0, 1 - used / provider.daily_limit);
+            }
+        } else {
+            lines.push("আজ পাঠানো: " + used + " (আনুমানিক)");
+        }
+        lines.forEach(function (line) {
+            const row = document.createElement("div");
+            row.className = "muted";
+            row.textContent = line;
+            card.appendChild(row);
+        });
+        if (ratio !== null) {
+            const bar = document.createElement("div");
+            bar.className = "bar";
+            const fill = document.createElement("div");
+            fill.style.width = Math.round(Math.max(0, Math.min(1, ratio)) * 100) + "%";
+            bar.appendChild(fill);
+            card.appendChild(bar);
+        }
+        box.appendChild(card);
+    });
+}
+
+async function refresh_openrouter(provider) {
+    const url = provider.base_url.replace(/\/+$/, "") + "/key";
+    const response = await http_request("GET", url, {"Authorization": "Bearer " + provider.api_key});
+    if (response.status !== 200) {
+        return;
+    }
+    const parsed = parse_openrouter_key(JSON.parse(response.body));
+    if (parsed) {
+        live[provider.name] = Object.assign({}, live[provider.name], {
+            remaining: parsed.remaining,
+            limit: parsed.limit,
+            source: "OpenRouter " + parsed.note,
+        });
+    }
+}
+
+async function refresh_board() {
+    set_status("বোর্ড রিফ্রেশ হচ্ছে...");
+    for (const provider of load_providers()) {
+        try {
+            if (provider.base_url.indexOf("openrouter.ai") !== -1) {
+                await refresh_openrouter(provider);
+            }
+        } catch (error) {
+            set_status(provider.name + ": রিফ্রেশ হয়নি");
+        }
+    }
+    render_board();
+    set_status("");
+}
+
+function render_providers() {
+    const box = document.getElementById("provider_list");
+    box.textContent = "";
+    load_providers().forEach(function (provider, index) {
+        const card = document.createElement("div");
+        card.className = "card";
+        const label = document.createElement("span");
+        label.textContent = provider.name + " · " + provider.model;
+        const remove = document.createElement("button");
+        remove.className = "small";
+        remove.textContent = "মুছো";
+        remove.addEventListener("click", function () {
+            const list = load_providers();
+            list.splice(index, 1);
+            write_json(STORAGE_KEY, list);
+            render_providers();
+            render_board();
+        });
+        card.appendChild(label);
+        card.appendChild(remove);
+        box.appendChild(card);
+    });
+}
+
+function render_entry(entry) {
+    const log = document.getElementById("log");
+    const card = document.createElement("div");
+    card.className = "card";
+    const head = document.createElement("div");
+    head.className = entry.applied ? "ok" : "warn";
+    head.textContent = "রাউন্ড " + entry.round + " · " + entry.proposer
+        + (entry.applied ? " · প্রয়োগ হয়েছে" : " · প্রয়োগ হয়নি");
+    card.appendChild(head);
+    const lines = [];
+    if (entry.reason) {
+        lines.push("কারণ: " + entry.reason);
+    }
+    if (entry.note) {
+        lines.push(entry.note);
+    }
+    if (entry.error) {
+        lines.push("ত্রুটি: " + entry.error);
+    }
+    (entry.votes || []).forEach(function (vote) {
+        lines.push(vote.reviewer + ": " + vote.vote + " — " + vote.reason);
+    });
+    lines.forEach(function (line) {
+        const row = document.createElement("div");
+        row.className = "muted";
+        row.textContent = line;
+        card.appendChild(row);
+    });
+    log.appendChild(card);
+}
+
+function read_form() {
+    const limit = parseInt(document.getElementById("p_limit").value, 10);
+    return {
+        name: document.getElementById("p_name").value.trim(),
+        base_url: document.getElementById("p_url").value.trim().replace(/\/+$/, ""),
+        api_key: document.getElementById("p_key").value.trim(),
+        model: document.getElementById("p_model").value.trim(),
+        daily_limit: Number.isNaN(limit) || limit <= 0 ? 0 : limit,
+    };
+}
+
+document.getElementById("preset").addEventListener("change", function (event) {
+    const parts = event.target.value.split("|");
+    if (parts.length === 2 && parts[1] !== "") {
+        document.getElementById("p_name").value = parts[0];
+        document.getElementById("p_url").value = parts[1];
+    }
+});
+
+document.getElementById("models_btn").addEventListener("click", async function () {
+    const form = read_form();
+    if (!/^https:\/\/\S+$/.test(form.base_url) || form.api_key === "") {
+        set_status("মডেল আনতে Base URL ও key দরকার");
+        return;
+    }
+    set_status("মডেল তালিকা আনা হচ্ছে...");
+    try {
+        const response = await http_request("GET", form.base_url + "/models", {"Authorization": "Bearer " + form.api_key});
+        if (response.status !== 200) {
+            set_status("মডেল তালিকা পাওয়া যায়নি (HTTP " + response.status + "), নাম নিজে লেখো");
+            return;
+        }
+        const data = JSON.parse(response.body);
+        const items = Array.isArray(data.data) ? data.data : (Array.isArray(data.models) ? data.models : []);
+        const list = document.getElementById("model_list");
+        list.textContent = "";
+        items.slice(0, 200).forEach(function (item) {
+            const id = String(item.id || item.name || "").replace(/^models\//, "");
+            if (id !== "") {
+                const option = document.createElement("option");
+                option.value = id;
+                list.appendChild(option);
+            }
+        });
+        set_status(items.length + " টি মডেল পাওয়া গেছে। মডেল ঘরে ট্যাপ করে বেছে নাও।");
+    } catch (error) {
+        set_status("মডেল তালিকা আনা যায়নি: " + String(error.message || error));
+    }
+});
+
+document.getElementById("add_btn").addEventListener("click", function () {
+    const provider = read_form();
+    const errors = validate_provider(provider);
+    if (errors.length > 0) {
+        set_status("ভুল বা খালি ঘর: " + errors.join(", "));
+        return;
+    }
+    const list = load_providers();
+    if (list.some(function (item) {
+        return item.name === provider.name;
+    })) {
+        set_status("এই নামে AI আগেই আছে");
+        return;
+    }
+    list.push(provider);
+    write_json(STORAGE_KEY, list);
+    ["p_name", "p_url", "p_key", "p_model", "p_limit"].forEach(function (id) {
+        document.getElementById(id).value = "";
+    });
+    document.getElementById("preset").value = "";
+    set_status("");
+    render_providers();
+    render_board();
+});
+
+document.getElementById("refresh_btn").addEventListener("click", refresh_board);
+
+document.getElementById("file_input").addEventListener("change", function (event) {
+    const file = event.target.files[0];
+    if (!file) {
+        return;
+    }
+    const reader = new FileReader();
+    reader.onload = function () {
+        document.getElementById("doc").value = String(reader.result);
+    };
+    reader.readAsText(file);
+});
+
+document.getElementById("run_btn").addEventListener("click", async function () {
+    const button = document.getElementById("run_btn");
+    const rounds = Math.max(1, Math.min(60, parseInt(document.getElementById("rounds").value, 10) || 1));
+    const doc_text = document.getElementById("doc").value;
+    const goal = document.getElementById("goal").value.trim();
+    if (doc_text.trim() === "" || goal === "") {
+        set_status("লক্ষ্য ও ফাইল দুটোই দরকার");
+        return;
+    }
+    document.getElementById("log").textContent = "";
+    button.disabled = true;
+    set_status("চলছে...");
+    try {
+        const result = await run_session({
+            providers: load_providers(),
+            document: doc_text,
+            goal: goal,
+            rounds: rounds,
+            http_post: http_post,
+            is_available: is_available,
+            on_event: handle_event,
+        });
+        document.getElementById("result").value = result.document;
+        set_status("শেষ");
+    } catch (error) {
+        set_status("ত্রুটি: " + String(error.message || error));
+    } finally {
+        button.disabled = false;
+        render_board();
+    }
+});
+
+document.getElementById("copy_btn").addEventListener("click", async function () {
+    const area = document.getElementById("result");
+    try {
+        await navigator.clipboard.writeText(area.value);
+        set_status("কপি হয়েছে");
+    } catch (error) {
+        area.select();
+        set_status("লেখা বেছে নেওয়া হয়েছে, নিজে কপি করো");
+    }
+});
+
+document.getElementById("download_btn").addEventListener("click", function () {
+    const blob = new Blob([document.getElementById("result").value], {type: "text/plain"});
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = "result.txt";
+    link.click();
+    URL.revokeObjectURL(link.href);
+});
+
+render_providers();
+render_board();
+// UI_END
+</script>
+</body>
+</html>
