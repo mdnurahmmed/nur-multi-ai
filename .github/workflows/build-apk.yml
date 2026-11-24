@@ -1,0 +1,70 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Prepare web files
+        run: |
+          mkdir -p www
+          cp index.html www/index.html
+
+      - name: Create Capacitor project
+        run: |
+          npm init -y
+          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.nur.multiai",
+            "appName": "NUR Multi-AI",
+            "webDir": "www",
+            "plugins": {
+              "CapacitorHttp": {
+                "enabled": true
+              }
+            }
+          }
+          EOF
+          npx cap add android
+          npx cap sync android
+
+      - name: Ensure internet permission
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          grep -q "android.permission.INTERNET" "$MANIFEST" || sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET" />\n    <application|' "$MANIFEST"
+          grep -q "android.permission.INTERNET" "$MANIFEST"
+
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: nur-multi-ai-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
